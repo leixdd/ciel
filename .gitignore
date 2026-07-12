@@ -1,0 +1,20 @@
+# Sensitive: voice transcripts, replies, engine logs
+brain/memory/logs/
+*.jsonl
+*.log
+
+# Sensitive: local config (home paths, device names, model/voice choices)
+# App regenerates it from Config.default on first run. Commit config.example.json instead if you want a template.
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# SwiftPM build output + assembled app bundle
+app/.build/
+*.app/
+
+# macOS
+.DS_Store

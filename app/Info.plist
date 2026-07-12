@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.otis.ciel</string>
+    <key>CFBundleName</key>
+    <string>C.I.E.L</string>
+    <key>CFBundleExecutable</key>
+    <string>CIEL</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>C.I.E.L dictates with your microphone.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>C.I.E.L reads your calendar to answer questions about your schedule.</string>
+</dict>
+</plist>
