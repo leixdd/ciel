@@ -6,6 +6,7 @@ struct Config: Codable, Equatable {
     var hotkey: String
     var log_dir: String
     var input_device: String?
+    var output_device: String?
     var speak_mode: Bool?
     var tts_model: String?
     var tts_voice: String?
@@ -17,6 +18,7 @@ struct Config: Codable, Equatable {
         hotkey: "alt_r",
         log_dir: root + "/brain/memory/logs",
         input_device: nil,
+        output_device: nil,
         speak_mode: nil,
         tts_model: nil,
         tts_voice: nil
@@ -65,6 +67,7 @@ private struct EngineEvent: Decodable {
     var reply: String?
     var message: String?
     var devices: [String]?
+    var output_devices: [String]?
     var tools: [ToolInfo]?
 }
 
@@ -77,9 +80,11 @@ final class Engine: ObservableObject {
     @Published private(set) var startedWithPerms = false
     @Published private(set) var debugLog: [LogLine] = []
     @Published var inputDevices: [String] = []
+    @Published var outputDevices: [String] = []
     @Published var toolsList: [ToolInfo] = []
 
     private var process: Process?
+    private var stdin: FileHandle?
     private var restarting = false
     private var logFile: FileHandle?
     private static let logCap = 500
@@ -124,6 +129,10 @@ final class Engine: ObservableObject {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "")
         proc.environment = env
+
+        let inPipe = Pipe()
+        proc.standardInput = inPipe
+        stdin = inPipe.fileHandleForWriting
 
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -182,6 +191,7 @@ final class Engine: ObservableObject {
 
     private func handle(_ ev: EngineEvent) {
         if let devices = ev.devices { inputDevices = devices }
+        if let d = ev.output_devices { outputDevices = d }
         if let tools = ev.tools { toolsList = tools }
         switch ev.event {
         case "loading": status = "loading"; statusDetail = ""
@@ -192,7 +202,12 @@ final class Engine: ObservableObject {
         case "idle": status = "ready"; statusDetail = ""
         case "transcript":
             if let text = ev.text {
-                history.insert(Entry(ts: ev.ts ?? "", text: text, reply: ev.reply), at: 0)
+                // Typed chat pre-inserts a reply-less entry; fill it. Dictation has none — insert.
+                if let idx = history.lastIndex(where: { $0.reply == nil && $0.text == text }) {
+                    history[idx].reply = ev.reply
+                } else {
+                    history.insert(Entry(ts: ev.ts ?? "", text: text, reply: ev.reply), at: 0)
+                }
             }
             status = "ready"; statusDetail = ""
         case "error":
@@ -222,6 +237,23 @@ final class Engine: ObservableObject {
         process?.terminationHandler = nil
         process?.terminate()
         process = nil
+    }
+
+    func send(_ text: String) {
+        let msg = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: ["chat": msg]),
+              let line = String(data: data, encoding: .utf8) else { return }
+        try? stdin?.write(contentsOf: Data((line + "\n").utf8))
+        history.insert(Entry(ts: "", text: msg, reply: nil), at: 0)  // optimistic; reply filled by transcript event
+    }
+
+    func speak(_ text: String, lang: String, voice: String, model: String) {
+        let msg = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: ["tts": ["text": msg, "lang": lang, "voice": voice, "model": model]]),
+              let line = String(data: data, encoding: .utf8) else { return }
+        try? stdin?.write(contentsOf: Data((line + "\n").utf8))
     }
 
     func autoHealPermissions() {

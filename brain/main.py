@@ -1,15 +1,15 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["mlx-whisper", "sounddevice", "pynput", "numpy", "mlx-lm", "mlx-audio", "misaki[en]", "pyobjc-framework-EventKit"]
+# dependencies = ["mlx-whisper", "sounddevice", "pynput", "numpy", "mlx-lm", "mlx-audio", "misaki[en,ja]", "pyobjc-framework-EventKit"]
 # ///
 """Wispr Flow-style local dictation: hold the hotkey, speak, release, paste."""
-import subprocess, sys, threading, time
+import json, subprocess, sys, threading, time
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
 
 from memory.store import CFG, emit
 from memory import tools as brain_tools
-from hearing.microphone import Recorder, input_devices
+from hearing.microphone import Recorder, input_devices, output_devices
 from cognitive import whisper_stt
 
 SPEAK = bool(CFG.get("speak_mode"))
@@ -20,6 +20,60 @@ HOTKEY = getattr(Key, CFG["hotkey"])
 kb = Controller()
 rec = Recorder(CFG.get("input_device"))
 
+_voice_ready = False
+_voice_lock = threading.Lock()  # serialize LLM+TTS across dictation and typed chat
+
+
+def ensure_voice():
+    """Lazy-load LLM+TTS the first time voice output is needed (e.g. typed chat with speak_mode off)."""
+    global _voice_ready, llm, tts
+    if _voice_ready:
+        return
+    from cognitive import llm, tts
+    emit("loading")
+    llm.warm(); tts.warm()
+    _voice_ready = True
+
+
+def respond(text):
+    """Reply with the LLM, speak it, log a transcript. Shared by typed chat and speak-mode dictation."""
+    ensure_voice()
+    emit("speaking")
+    with _voice_lock:  # ponytail: one voice at a time; concurrent dictation+chat would garble audio
+        reply = llm.reply(text)
+        tts.say(reply)  # blocks until playback done
+    emit("transcript", text=text, reply=reply)
+
+
+def speak_tts(spec):
+    """TTS playground request from the app: {"text","lang","model"} -> synthesize and play."""
+    text = (spec.get("text") or "").strip()
+    if not text:
+        return
+    from cognitive import tts  # idempotent; playground needs TTS but not the LLM
+    emit("speaking")
+    with _voice_lock:
+        tts.speak(text, lang=spec.get("lang", "a"), voice=spec.get("voice"), model=spec.get("model"))
+    emit("idle")
+
+
+def chat_loop():
+    """Read one JSON object per stdin line from the app; {"chat":...} speaks a reply, {"tts":{...}} plays raw TTS."""
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        try:
+            if msg.get("chat"):
+                respond(msg["chat"].strip())
+            elif msg.get("tts"):
+                speak_tts(msg["tts"])
+        except Exception as e:
+            emit("error", message=str(e))
+
 
 def transcribe_and_inject(audio):
     try:
@@ -28,10 +82,7 @@ def transcribe_and_inject(audio):
             emit("idle")
             return
         if SPEAK:
-            emit("speaking")
-            reply = llm.reply(text)
-            tts.say(reply)  # blocks until playback done
-            emit("transcript", text=text, reply=reply)
+            respond(text)
             return
         old = subprocess.run(["pbpaste"], capture_output=True).stdout
         subprocess.run(["pbcopy"], input=text.encode())
@@ -88,11 +139,15 @@ def main():
     t0 = time.time()
     try:
         whisper_stt.warm()
-        if SPEAK: llm.warm(); tts.warm()
+        if SPEAK:
+            global _voice_ready
+            llm.warm(); tts.warm()
+            _voice_ready = True
     except Exception as e:
         emit("error", message=f"startup: {e}")
         raise
-    emit("ready", model=whisper_stt.MODEL, hotkey=CFG["hotkey"], load_secs=round(time.time() - t0, 1), devices=input_devices(), tools=brain_tools.listing())
+    emit("ready", model=whisper_stt.MODEL, hotkey=CFG["hotkey"], load_secs=round(time.time() - t0, 1), devices=input_devices(), output_devices=output_devices(), tools=brain_tools.listing())
+    threading.Thread(target=chat_loop, daemon=True).start()  # typed chat from the app over stdin
     with keyboard.Listener(on_press=on_press, on_release=on_release) as l:
         l.join()
 

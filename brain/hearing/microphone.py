@@ -7,6 +7,10 @@ def input_devices():
     return list(dict.fromkeys(d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0))
 
 
+def output_devices():
+    return list(dict.fromkeys(d["name"] for d in sd.query_devices() if d["max_output_channels"] > 0))
+
+
 class Recorder:
     def __init__(self, device=None):
         self.recording = False

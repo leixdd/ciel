@@ -14,6 +14,15 @@ let ttsModels = [
     "mlx-community/Kokoro-82M-8bit",
     "mlx-community/Kokoro-82M-6bit",
     "mlx-community/Kokoro-82M-4bit",
+    "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",  // suited to 16GB M2 Pro: quantized, ~2.7GB
+]
+
+// Qwen3-TTS is a different engine: named speakers (multilingual) + language names, auto-detect available.
+let qwenSpeakers = ["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"]
+let qwenLanguages: [(label: String, value: String)] = [
+    ("Auto-detect", "auto"), ("English", "english"), ("Chinese", "chinese"), ("Japanese", "japanese"),
+    ("Korean", "korean"), ("Spanish", "spanish"), ("French", "french"), ("German", "german"),
+    ("Italian", "italian"), ("Portuguese", "portuguese"), ("Russian", "russian"),
 ]
 
 let ttsVoices: [(label: String, value: String)] = [
@@ -28,6 +37,33 @@ let ttsVoices: [(label: String, value: String)] = [
     ("Isabella (UK female)", "bf_isabella"),
     ("Fable (UK male)", "bm_fable"),
     ("George (UK male)", "bm_george"),
+]
+
+// Kokoro languages whose g2p backend ships in this install (code = Kokoro lang_code).
+// ponytail: add ("Mandarin Chinese","z") after `uv add misaki[zh]` (needs jieba/pypinyin backend).
+let ttsLanguages: [(label: String, value: String)] = [
+    ("American English", "a"),
+    ("British English", "b"),
+    ("Spanish", "e"),
+    ("French", "f"),
+    ("Hindi", "h"),
+    ("Italian", "i"),
+    ("Portuguese (Brazil)", "p"),
+    ("Japanese", "j"),
+]
+
+// Kokoro voices per language code (from the model's voices manifest). Filters the voice picker.
+let ttsVoicesByLang: [String: [String]] = [
+    "a": ["af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore", "af_nicole",
+          "af_nova", "af_river", "af_sarah", "af_sky", "am_adam", "am_echo", "am_eric", "am_fenrir",
+          "am_liam", "am_michael", "am_onyx", "am_puck", "am_santa"],
+    "b": ["bf_emma", "bf_alice", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis"],
+    "e": ["ef_dora", "em_alex", "em_santa"],
+    "f": ["ff_siwis"],
+    "h": ["hf_alpha", "hf_beta", "hm_omega", "hm_psi"],
+    "i": ["if_sara", "im_nicola"],
+    "p": ["pf_dora", "pm_alex", "pm_santa"],
+    "j": ["jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"],
 ]
 
 let hotkeys: [(label: String, value: String)] = [
@@ -73,12 +109,14 @@ extension Engine {
 // MARK: Navigation
 
 enum Page: String, CaseIterable, Identifiable {
-    case overview, model, history, tools, debug, settings
+    case overview, chat, tts, model, history, tools, debug, settings
     var id: Self { self }
-    var label: String { rawValue.capitalized }
+    var label: String { self == .tts ? "TTS" : rawValue.capitalized }
     var symbol: String {
         switch self {
         case .overview: return "waveform"
+        case .chat: return "bubble.left.and.bubble.right"
+        case .tts: return "speaker.wave.2"
         case .model: return "cpu"
         case .history: return "clock"
         case .tools: return "wrench.and.screwdriver"
@@ -101,6 +139,8 @@ struct CommandCenterView: View {
         } detail: {
             switch page ?? .overview {
             case .overview: OverviewPage()
+            case .chat: ChatPage()
+            case .tts: TtsPage()
             case .model: ModelPage()
             case .history: HistoryPage()
             case .tools: ToolsPage()
@@ -251,6 +291,97 @@ private struct ModelPage: View {
 
 // MARK: History
 
+// MARK: Chat
+
+private struct ChatPage: View {
+    @EnvironmentObject var engine: Engine
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                List(engine.history.reversed()) { entry in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(entry.text).font(.callout).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        Text(entry.reply ?? "…").font(.callout)
+                            .foregroundStyle(.secondary).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .listRowSeparator(.hidden)
+                    .id(entry.id)
+                }
+                .listStyle(.inset)
+                .onChange(of: engine.history.count) { _ in
+                    if let newest = engine.history.first { proxy.scrollTo(newest.id) }
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("Message C.I.E.L…", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(send)
+                Button("Send", action: send)
+                    .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(12)
+        }
+    }
+
+    private func send() {
+        engine.send(draft)
+        draft = ""
+    }
+}
+
+// MARK: TTS playground
+
+private struct TtsPage: View {
+    @EnvironmentObject var engine: Engine
+    @State private var text = ""
+    @State private var lang = "a"
+    @State private var voice = ttsVoicesByLang["a"]?.first ?? "af_heart"
+    @State private var model = ttsModels[0]
+
+    private var isQwen: Bool { model.contains("Qwen3-TTS") }
+    private var langs: [(label: String, value: String)] { isQwen ? qwenLanguages : ttsLanguages }
+    private var voices: [String] { isQwen ? qwenSpeakers : (ttsVoicesByLang[lang] ?? []) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("TEXT TO SPEECH").font(.caption).foregroundStyle(.secondary)
+            Picker("Model", selection: $model) {
+                ForEach(ttsModels, id: \.self) { Text($0).tag($0) }
+            }
+            Picker("Language", selection: $lang) {
+                ForEach(langs, id: \.value) { Text($0.label).tag($0.value) }
+            }
+            Picker(isQwen ? "Speaker" : "Voice", selection: $voice) {
+                ForEach(voices, id: \.self) { Text($0).tag($0) }
+            }
+            TextEditor(text: $text)
+                .font(.body)
+                .frame(minHeight: 160)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
+            HStack {
+                if engine.status == "speaking" { Text("Speaking…").foregroundStyle(.secondary) }
+                Spacer()
+                Button {
+                    engine.speak(text, lang: lang, voice: voice, model: model)
+                } label: {
+                    Label("Speak", systemImage: "play.fill")
+                }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: model) { _ in lang = langs.first?.value ?? "a"; voice = voices.first ?? "" }  // switch engine
+        .onChange(of: lang) { _ in voice = voices.first ?? "" }  // keep voice valid for the language
+        .onAppear { if let m = engine.config.tts_model, ttsModels.contains(m) { model = m } }
+    }
+}
+
 private struct HistoryPage: View {
     @EnvironmentObject var engine: Engine
     @State private var query = ""
@@ -393,6 +524,13 @@ private struct SettingsPage: View {
                         Text("\(cur) (unavailable)").tag(cur)
                     }
                 }
+                Picker("Speaker", selection: speakerBinding) {
+                    Text("System default").tag("")
+                    ForEach(engine.outputDevices, id: \.self) { Text($0).tag($0) }
+                    if let cur = engine.config.output_device, !cur.isEmpty, !engine.outputDevices.contains(cur) {
+                        Text("\(cur) (unavailable)").tag(cur)
+                    }
+                }
                 HStack {
                     Text("Log folder")
                     Spacer()
@@ -440,6 +578,17 @@ private struct SettingsPage: View {
             set: { newValue in
                 guard newValue != (engine.config.input_device ?? "") else { return }
                 engine.config.input_device = newValue.isEmpty ? nil : newValue
+                engine.restart()
+            }
+        )
+    }
+
+    private var speakerBinding: Binding<String> {
+        Binding(
+            get: { engine.config.output_device ?? "" },
+            set: { newValue in
+                guard newValue != (engine.config.output_device ?? "") else { return }
+                engine.config.output_device = newValue.isEmpty ? nil : newValue
                 engine.restart()
             }
         )
