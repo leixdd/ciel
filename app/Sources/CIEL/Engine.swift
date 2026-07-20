@@ -10,6 +10,7 @@ struct Config: Codable, Equatable {
     var speak_mode: Bool?
     var tts_model: String?
     var tts_voice: String?
+    var novita_api_key: String?
 
     static let root = "/Users/leilei/OTis/ciel-ai-workspace/CIELAI"
     static let path = root + "/config.json"
@@ -21,7 +22,8 @@ struct Config: Codable, Equatable {
         output_device: nil,
         speak_mode: nil,
         tts_model: nil,
-        tts_voice: nil
+        tts_voice: nil,
+        novita_api_key: nil
     )
 }
 
@@ -69,6 +71,18 @@ private struct EngineEvent: Decodable {
     var devices: [String]?
     var output_devices: [String]?
     var tools: [ToolInfo]?
+    var voice: String?
+    var lang: String?
+    var file: String?
+}
+
+struct AudioClip: Identifiable {
+    var id: String { file }
+    let ts: String
+    let text: String
+    let model: String
+    let voice: String
+    let file: String
 }
 
 @MainActor
@@ -82,6 +96,16 @@ final class Engine: ObservableObject {
     @Published var inputDevices: [String] = []
     @Published var outputDevices: [String] = []
     @Published var toolsList: [ToolInfo] = []
+    @Published var audioHistory: [AudioClip] = []
+
+    // TTS playground state — lives here (not in the View) so it survives page switches.
+    @Published var ttsText = ""
+    @Published var ttsLang = "a"
+    @Published var ttsVoice = ttsVoicesByLang["a"]?.first ?? "af_heart"
+    @Published var ttsModel = ttsModels[0]
+    @Published var ttsTemp: Double = 0.7    // Fish Audio tuning (loaded from the selected voice's preset)
+    @Published var ttsSpeed: Double = 1.0
+    @Published var ttsVolume: Double = 0
 
     private var process: Process?
     private var stdin: FileHandle?
@@ -107,6 +131,7 @@ final class Engine: ObservableObject {
         } else {
             config = .default
         }
+        if let m = config.tts_model, ttsModels.contains(m) { ttsModel = m }
         start()
     }
 
@@ -200,6 +225,11 @@ final class Engine: ObservableObject {
         case "transcribing": status = "transcribing"; statusDetail = ""
         case "speaking": status = "speaking"; statusDetail = ""
         case "idle": status = "ready"; statusDetail = ""
+        case "tts_saved":
+            if let f = ev.file {
+                audioHistory.insert(AudioClip(ts: ev.ts ?? "", text: ev.text ?? "",
+                    model: ev.model ?? "", voice: ev.voice ?? "", file: f), at: 0)
+            }
         case "transcript":
             if let text = ev.text {
                 // Typed chat pre-inserts a reply-less entry; fill it. Dictation has none — insert.
@@ -248,10 +278,25 @@ final class Engine: ObservableObject {
         history.insert(Entry(ts: "", text: msg, reply: nil), at: 0)  // optimistic; reply filled by transcript event
     }
 
-    func speak(_ text: String, lang: String, voice: String, model: String) {
+    func speak(_ text: String, lang: String, voice: String, model: String,
+               temperature: Double, speed: Double, volume: Double) {
         let msg = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tts: [String: Any] = ["text": msg, "lang": lang, "voice": voice, "model": model,
+                                  "temperature": temperature, "speed": speed, "volume": volume]
         guard !msg.isEmpty,
-              let data = try? JSONSerialization.data(withJSONObject: ["tts": ["text": msg, "lang": lang, "voice": voice, "model": model]]),
+              let data = try? JSONSerialization.data(withJSONObject: ["tts": tts]),
+              let line = String(data: data, encoding: .utf8) else { return }
+        try? stdin?.write(contentsOf: Data((line + "\n").utf8))
+    }
+
+    func stopSpeaking() {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["stop": true]),
+              let line = String(data: data, encoding: .utf8) else { return }
+        try? stdin?.write(contentsOf: Data((line + "\n").utf8))
+    }
+
+    func replay(_ file: String) {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["replay": file]),
               let line = String(data: data, encoding: .utf8) else { return }
         try? stdin?.write(contentsOf: Data((line + "\n").utf8))
     }
@@ -260,6 +305,8 @@ final class Engine: ObservableObject {
         // Auto-heal: a pynput listener created before the grants is permanently dead.
         if Permissions.engineReadyPerms && !startedWithPerms { restart() }
     }
+
+    func saveConfig() { writeConfig() }  // persist config.json without restarting (e.g. API keys read fresh)
 
     private func writeConfig() {
         let enc = JSONEncoder()
@@ -283,5 +330,20 @@ final class Engine: ObservableObject {
             entries.append(Entry(ts: ev.ts ?? "", text: text, reply: ev.reply))
         }
         history = Array(entries.suffix(200).reversed())
+        loadAudioHistory()
+    }
+
+    private func loadAudioHistory() {
+        let url = URL(fileURLWithPath: Config.root + "/brain/memory/audios/history.jsonl")
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { audioHistory = []; return }
+        var clips: [AudioClip] = []
+        for line in content.split(separator: "\n") {
+            guard let data = line.data(using: .utf8),
+                  let ev = try? JSONDecoder().decode(EngineEvent.self, from: data),
+                  let f = ev.file else { continue }
+            clips.append(AudioClip(ts: ev.ts ?? "", text: ev.text ?? "",
+                model: ev.model ?? "", voice: ev.voice ?? "", file: f))
+        }
+        audioHistory = Array(clips.suffix(200).reversed())
     }
 }

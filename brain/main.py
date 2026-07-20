@@ -22,6 +22,7 @@ rec = Recorder(CFG.get("input_device"))
 
 _voice_ready = False
 _voice_lock = threading.Lock()  # serialize LLM+TTS across dictation and typed chat
+_stop = threading.Event()       # set by a "stop" message to abort the current reply/TTS
 
 
 def ensure_voice():
@@ -38,27 +39,59 @@ def ensure_voice():
 def respond(text):
     """Reply with the LLM, speak it, log a transcript. Shared by typed chat and speak-mode dictation."""
     ensure_voice()
-    emit("speaking")
+    _stop.clear()
+    emit("processing")  # thinking — not speaking yet
     with _voice_lock:  # ponytail: one voice at a time; concurrent dictation+chat would garble audio
+        if _stop.is_set():
+            emit("idle"); return
         reply = llm.reply(text)
-        tts.say(reply)  # blocks until playback done
+        emit("speaking")
+        tts.say(reply)  # blocks until playback done (or stop() cuts it)
     emit("transcript", text=text, reply=reply)
 
 
 def speak_tts(spec):
-    """TTS playground request from the app: {"text","lang","model"} -> synthesize and play."""
+    """TTS playground request from the app: {"text","lang","voice","model"} -> synthesize and play."""
     text = (spec.get("text") or "").strip()
     if not text:
         return
     from cognitive import tts  # idempotent; playground needs TTS but not the LLM
-    emit("speaking")
+    _stop.clear()
+    emit("processing")  # loading model / generating audio — not speaking yet
+    rec = None
     with _voice_lock:
-        tts.speak(text, lang=spec.get("lang", "a"), voice=spec.get("voice"), model=spec.get("model"))
+        if _stop.is_set():
+            emit("idle"); return
+        rec = tts.speak(text, lang=spec.get("lang", "a"), voice=spec.get("voice"), model=spec.get("model"),
+                        on_play=lambda: emit("speaking"), should_stop=_stop.is_set,
+                        temperature=spec.get("temperature"), speed=spec.get("speed"), volume=spec.get("volume"))
+    if rec:
+        emit("tts_saved", **rec)  # live-update the audio history in the app
     emit("idle")
 
 
+def replay_audio(path):
+    """Replay a saved playground clip through the current output device."""
+    from cognitive import tts
+    _stop.clear()
+    emit("speaking")
+    with _voice_lock:
+        if _stop.is_set():
+            emit("idle"); return
+        tts.play_file(path)
+    emit("idle")
+
+
+def _run(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:
+        emit("error", message=str(e))
+
+
 def chat_loop():
-    """Read one JSON object per stdin line from the app; {"chat":...} speaks a reply, {"tts":{...}} plays raw TTS."""
+    """Read one JSON object per stdin line from the app: {"chat":...} replies, {"tts":{...}} plays raw TTS,
+    {"stop":true} halts talking. Jobs run on their own thread so a stop is read while one is playing."""
     for line in sys.stdin:
         try:
             msg = json.loads(line)
@@ -66,13 +99,15 @@ def chat_loop():
             continue
         if not isinstance(msg, dict):
             continue
-        try:
-            if msg.get("chat"):
-                respond(msg["chat"].strip())
-            elif msg.get("tts"):
-                speak_tts(msg["tts"])
-        except Exception as e:
-            emit("error", message=str(e))
+        if msg.get("stop"):
+            _stop.set()
+            import cognitive.tts as tts; tts.stop()
+        elif msg.get("chat"):
+            threading.Thread(target=_run, args=(respond, msg["chat"].strip()), daemon=True).start()
+        elif msg.get("tts"):
+            threading.Thread(target=_run, args=(speak_tts, msg["tts"]), daemon=True).start()
+        elif msg.get("replay"):
+            threading.Thread(target=_run, args=(replay_audio, msg["replay"]), daemon=True).start()
 
 
 def transcribe_and_inject(audio):

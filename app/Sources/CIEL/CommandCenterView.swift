@@ -15,7 +15,27 @@ let ttsModels = [
     "mlx-community/Kokoro-82M-6bit",
     "mlx-community/Kokoro-82M-4bit",
     "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",  // suited to 16GB M2 Pro: quantized, ~2.7GB
+    "novita/fish-audio-s2-pro",  // cloud (Novita) — needs a Novita API key in Settings
 ]
+
+// Novita Fish Audio S2 Pro voices. `id` is the reference_id; personality is descriptive; temp/speed/
+// volume are the voice's default tuning preset (editable per-session in the TTS page).
+struct FishVoice: Identifiable {
+    let label: String, id: String, personality: String
+    let temperature: Double, speed: Double, volume: Double
+}
+let fishVoices: [FishVoice] = [
+    FishVoice(label: "yuki", id: "ef6cb429e08b4b669537484c56f4bd07",
+              personality: "Bright, energetic voice with a lively, upbeat delivery.",
+              temperature: 0.7, speed: 1.0, volume: 0),
+    FishVoice(label: "3d3n", id: "9bb57c9442c4489a98945ba19e055638",
+              personality: "Calm, measured voice with a warm, grounded tone.",
+              temperature: 0.6, speed: 1.0, volume: 0),
+    FishVoice(label: "leiden", id: "5161d41404314212af1254556477c17d",
+              personality: "A youthful and friendly female voice with a gentle, polite tone. Her speech is clear and expressive, making it well-suited for conversational and narrative content.",
+              temperature: 0.7, speed: 1.0, volume: 0),
+]
+let fishVoicesByID = Dictionary(uniqueKeysWithValues: fishVoices.map { ($0.id, $0) })
 
 // Qwen3-TTS is a different engine: named speakers (multilingual) + language names, auto-detect available.
 let qwenSpeakers = ["serena", "vivian", "uncle_fu", "ryan", "aiden", "ono_anna", "sohee", "eric", "dylan"]
@@ -83,7 +103,7 @@ extension Engine {
         switch status {
         case "ready": return .green
         case "recording": return .red
-        case "loading", "transcribing": return .orange
+        case "loading", "transcribing", "processing": return .orange
         case "speaking": return .blue
         case "error": return .red
         default: return .gray
@@ -97,6 +117,7 @@ extension Engine {
             return "Ready — hold \(name)"
         case "recording": return "Recording…"
         case "transcribing": return "Transcribing…"
+        case "processing": return "Processing…"
         case "speaking": return "Speaking…"
         case "loading": return "Loading model…"
         case "error": return statusDetail
@@ -337,48 +358,122 @@ private struct ChatPage: View {
 
 private struct TtsPage: View {
     @EnvironmentObject var engine: Engine
-    @State private var text = ""
-    @State private var lang = "a"
-    @State private var voice = ttsVoicesByLang["a"]?.first ?? "af_heart"
-    @State private var model = ttsModels[0]
 
-    private var isQwen: Bool { model.contains("Qwen3-TTS") }
+    private var isFish: Bool { engine.ttsModel.hasPrefix("novita/") }
+    private var isQwen: Bool { engine.ttsModel.contains("Qwen3-TTS") }
     private var langs: [(label: String, value: String)] { isQwen ? qwenLanguages : ttsLanguages }
-    private var voices: [String] { isQwen ? qwenSpeakers : (ttsVoicesByLang[lang] ?? []) }
+    private var voices: [String] {
+        if isFish { return fishVoices.map(\.id) }
+        return isQwen ? qwenSpeakers : (ttsVoicesByLang[engine.ttsLang] ?? [])
+    }
+    private var selectedFish: FishVoice? { fishVoicesByID[engine.ttsVoice] }
+    private var busy: Bool { engine.status == "processing" || engine.status == "speaking" }
 
     var body: some View {
+      ScrollView {
         VStack(alignment: .leading, spacing: 12) {
             Text("TEXT TO SPEECH").font(.caption).foregroundStyle(.secondary)
-            Picker("Model", selection: $model) {
+            Picker("Model", selection: $engine.ttsModel) {
                 ForEach(ttsModels, id: \.self) { Text($0).tag($0) }
             }
-            Picker("Language", selection: $lang) {
-                ForEach(langs, id: \.value) { Text($0.label).tag($0.value) }
+            if isFish {
+                Picker("Voice", selection: $engine.ttsVoice) {
+                    ForEach(fishVoices) { Text($0.label).tag($0.id) }
+                }
+                if let fv = selectedFish {
+                    Text(fv.personality).font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Group {
+                    tuningRow("Temperature", $engine.ttsTemp, 0...1, "%.2f")
+                    tuningRow("Speed", $engine.ttsSpeed, 0.5...2.0, "%.2f")
+                    tuningRow("Volume", $engine.ttsVolume, -10...10, "%.0f")
+                    HStack {
+                        Spacer()
+                        Button("Reset preset") { loadFishPreset() }.font(.caption)
+                    }
+                }
+                Text("Cloud voice (Novita). Set the API key in Settings.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Picker("Language", selection: $engine.ttsLang) {
+                    ForEach(langs, id: \.value) { Text($0.label).tag($0.value) }
+                }
+                Picker(isQwen ? "Speaker" : "Voice", selection: $engine.ttsVoice) {
+                    ForEach(voices, id: \.self) { Text($0).tag($0) }
+                }
             }
-            Picker(isQwen ? "Speaker" : "Voice", selection: $voice) {
-                ForEach(voices, id: \.self) { Text($0).tag($0) }
-            }
-            TextEditor(text: $text)
+            TextEditor(text: $engine.ttsText)
                 .font(.body)
                 .frame(minHeight: 160)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.3)))
             HStack {
-                if engine.status == "speaking" { Text("Speaking…").foregroundStyle(.secondary) }
+                if engine.status == "processing" { Text("Processing…").foregroundStyle(.secondary) }
+                else if engine.status == "speaking" { Text("Speaking…").foregroundStyle(.secondary) }
                 Spacer()
+                if busy {
+                    Button(role: .destructive) { engine.stopSpeaking() } label: {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                }
                 Button {
-                    engine.speak(text, lang: lang, voice: voice, model: model)
+                    engine.speak(engine.ttsText, lang: engine.ttsLang, voice: engine.ttsVoice, model: engine.ttsModel,
+                                 temperature: engine.ttsTemp, speed: engine.ttsSpeed, volume: engine.ttsVolume)
                 } label: {
                     Label("Speak", systemImage: "play.fill")
                 }
                 .keyboardShortcut(.return, modifiers: .command)
-                .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(engine.ttsText.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if !engine.audioHistory.isEmpty {
+                Divider()
+                Text("RECENT CLIPS").font(.caption).foregroundStyle(.secondary)
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(engine.audioHistory) { clip in
+                        HStack(alignment: .top, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(clip.text).font(.callout).lineLimit(2)
+                                Text(clipCaption(clip)).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button { engine.replay(clip.file) } label: {
+                                Image(systemName: "play.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(busy)
+                        }
+                        .padding(.vertical, 4)
+                        Divider()
+                    }
+                }
             }
         }
         .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: model) { _ in lang = langs.first?.value ?? "a"; voice = voices.first ?? "" }  // switch engine
-        .onChange(of: lang) { _ in voice = voices.first ?? "" }  // keep voice valid for the language
-        .onAppear { if let m = engine.config.tts_model, ttsModels.contains(m) { model = m } }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+      }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+      .onChange(of: engine.ttsModel) { _ in engine.ttsLang = langs.first?.value ?? "a"; engine.ttsVoice = voices.first ?? "" }
+      .onChange(of: engine.ttsLang) { _ in engine.ttsVoice = voices.first ?? "" }
+      .onChange(of: engine.ttsVoice) { _ in if isFish { loadFishPreset() } }  // pick voice -> load its personality preset
+    }
+
+    @ViewBuilder
+    private func tuningRow(_ label: String, _ value: Binding<Double>, _ range: ClosedRange<Double>, _ fmt: String) -> some View {
+        HStack {
+            Text(label).frame(width: 90, alignment: .leading).font(.caption)
+            Slider(value: value, in: range)
+            Text(String(format: fmt, value.wrappedValue)).font(.caption).monospacedDigit().frame(width: 44, alignment: .trailing)
+        }
+    }
+
+    private func loadFishPreset() {
+        guard let fv = selectedFish else { return }
+        engine.ttsTemp = fv.temperature; engine.ttsSpeed = fv.speed; engine.ttsVolume = fv.volume
+    }
+
+    private func clipCaption(_ c: AudioClip) -> String {
+        let m = c.model.components(separatedBy: "/").last ?? c.model
+        return [c.ts, m, c.voice].filter { !$0.isEmpty }.joined(separator: "  ·  ")
     }
 }
 
@@ -509,6 +604,7 @@ private struct DebugPage: View {
 private struct SettingsPage: View {
     @EnvironmentObject var engine: Engine
     @State private var perms = (mic: false, ax: false, input: false)
+    @State private var novitaKeyDraft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -541,6 +637,13 @@ private struct SettingsPage: View {
                         .lineLimit(1)
                     Button("Choose…") { chooseLogDir() }
                 }
+                HStack {
+                    Text("Novita API key")
+                    SecureField("for Fish Audio S2 Pro TTS", text: $novitaKeyDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { saveNovitaKey() }
+                    Button("Save") { saveNovitaKey() }
+                }
             }
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -557,8 +660,15 @@ private struct SettingsPage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             perms = (Permissions.mic, Permissions.accessibility, Permissions.inputMonitoring)
+            novitaKeyDraft = engine.config.novita_api_key ?? ""
             engine.autoHealPermissions()
         }
+    }
+
+    private func saveNovitaKey() {
+        let v = novitaKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        engine.config.novita_api_key = v.isEmpty ? nil : v
+        engine.saveConfig()  // Python reads the key fresh from config.json; no restart needed
     }
 
     private var hotkeyBinding: Binding<String> {
